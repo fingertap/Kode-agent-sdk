@@ -536,8 +536,12 @@ function stripTrailingSlash(url: string): string {
   return url.endsWith('/') ? url.slice(0, -1) : url;
 }
 
+type OpenAIChatMessageContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
 type OpenAIChatMessage =
-  | { role: 'system' | 'user' | 'assistant'; content: string | null; tool_calls?: any[] }
+  | { role: 'system' | 'user' | 'assistant'; content: string | OpenAIChatMessageContentPart[] | null; tool_calls?: any[] }
   | { role: 'tool'; tool_call_id: string; content: string };
 
 function blocksToText(blocks: ContentBlock[]): string {
@@ -545,6 +549,41 @@ function blocksToText(blocks: ContentBlock[]): string {
     .filter((b) => b.type === 'text')
     .map((b: any) => b.text)
     .join('\n');
+}
+
+function blocksToOpenAIContent(blocks: ContentBlock[]): string | OpenAIChatMessageContentPart[] | null {
+  const parts: OpenAIChatMessageContentPart[] = [];
+  let hasImages = false;
+  let hasNonWhitespaceText = false;
+
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      parts.push({ type: 'text', text: block.text });
+      if (block.text.trim().length > 0) {
+        hasNonWhitespaceText = true;
+      }
+      continue;
+    }
+
+    if (block.type === 'image_url') {
+      if (typeof block.image_url?.url === 'string' && block.image_url.url.length > 0) {
+        parts.push({ type: 'image_url', image_url: { url: block.image_url.url } });
+        hasImages = true;
+      }
+    }
+  }
+
+  if (!hasImages) {
+    const text = blocksToText(blocks).trim();
+    return text.length > 0 ? text : null;
+  }
+
+  // Some providers behave better when a text prompt precedes images.
+  if (!hasNonWhitespaceText) {
+    parts.unshift({ type: 'text', text: 'Reference image.' });
+  }
+
+  return parts;
 }
 
 function toOpenAIChatMessages(messages: Message[], systemPrompt?: string): OpenAIChatMessage[] {
@@ -555,6 +594,7 @@ function toOpenAIChatMessages(messages: Message[], systemPrompt?: string): OpenA
 
   for (const msg of messages) {
     const role = msg.role === 'system' ? 'user' : msg.role;
+    const content = blocksToOpenAIContent(msg.content);
     const text = blocksToText(msg.content).trim();
 
     const toolResults = msg.content.filter((b) => b.type === 'tool_result') as Array<any>;
@@ -571,8 +611,20 @@ function toOpenAIChatMessages(messages: Message[], systemPrompt?: string): OpenA
       }));
 
       out.push({ role: 'assistant', content: text.length > 0 ? text : null, tool_calls });
-    } else if (text.length > 0) {
-      out.push({ role: role as any, content: text });
+    } else if (content !== null) {
+      // For assistant messages without tool_calls, we only send text to keep compatibility.
+      if (role === 'assistant' && Array.isArray(content)) {
+        const assistantText = content
+          .filter((p) => p.type === 'text')
+          .map((p) => p.text)
+          .join('\n')
+          .trim();
+        if (assistantText.length > 0) {
+          out.push({ role: role as any, content: assistantText });
+        }
+      } else {
+        out.push({ role: role as any, content });
+      }
     }
 
     if (toolResults.length > 0) {
@@ -602,8 +654,17 @@ function toOpenAITools(tools: any[] | undefined): any[] {
 
 function openAIMessageToContentBlocks(msg: any): ContentBlock[] {
   const blocks: ContentBlock[] = [];
+
   if (typeof msg?.content === 'string' && msg.content.length > 0) {
     blocks.push({ type: 'text', text: msg.content });
+  } else if (Array.isArray(msg?.content)) {
+    for (const part of msg.content as any[]) {
+      if (part?.type === 'text' && typeof part.text === 'string' && part.text.length > 0) {
+        blocks.push({ type: 'text', text: part.text });
+      } else if (part?.type === 'image_url' && typeof part?.image_url?.url === 'string' && part.image_url.url.length > 0) {
+        blocks.push({ type: 'image_url', image_url: { url: part.image_url.url } });
+      }
+    }
   }
 
   const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
